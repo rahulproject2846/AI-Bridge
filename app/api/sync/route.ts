@@ -7,16 +7,15 @@ import { logError } from "@/lib/log";
 import { sha256Hex } from "@/lib/hash";
 
 export const maxDuration = 60;
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '4mb',
-    },
-  },
-};
 
 export async function POST(req: Request) {
   try {
+    // Manual payload size check for Next.js 16.1.6 App Router
+    const contentLength = req.headers.get('content-length');
+    if (contentLength && parseInt(contentLength) > 4 * 1024 * 1024) {
+      return NextResponse.json({ error: "Payload too large" }, { status: 413 });
+    }
+
     const ip = getClientIp(req);
     if (!checkRateLimit("sync", ip, 30, 60_000)) {
       return NextResponse.json({ error: "Too many requests" }, { status: 429 });
