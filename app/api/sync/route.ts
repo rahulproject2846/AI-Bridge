@@ -6,6 +6,15 @@ import { checkRateLimit, getClientIp, parseJsonWithLimit, errorStatus } from "@/
 import { logError } from "@/lib/log";
 import { sha256Hex } from "@/lib/hash";
 
+export const maxDuration = 60;
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '4mb',
+    },
+  },
+};
+
 export async function POST(req: Request) {
   try {
     const ip = getClientIp(req);
@@ -19,7 +28,7 @@ export async function POST(req: Request) {
       files?: { path: string; content: string }[];
       expiresAt?: string;
       password?: string;
-    }>(req, 5 * 1024 * 1024);
+    }>(req, 4 * 1024 * 1024);
     const shareId: string | undefined = body?.shareId;
     const projectName: string | undefined = body?.projectName;
     const files: Array<{ path: string; content: string }> = Array.isArray(body?.files)

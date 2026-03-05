@@ -26,6 +26,7 @@ export default function Home() {
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
   const [serverContents, setServerContents] = useState<Map<string, string>>(new Map());
   const [syncing, setSyncing] = useState(false);
+  const [syncLock, setSyncLock] = useState(false);
   const [projectStats, setProjectStats] = useState<
     Map<
       number,
@@ -126,12 +127,24 @@ export default function Home() {
   const activeProject =
     (projects || []).find((p) => p.id === activeProjectId) ?? (projects && projects[0]) ?? null;
 
+  const sanitizeContent = (text: string) => {
+    const lf = text.replace(/\r\n?/g, "\n");
+    return lf
+      .split("\n")
+      .map((line) => line.replace(/[ \t]+$/g, ""))
+      .join("\n");
+  };
+
   useEffect(() => {
     if (!autoSync) return;
     const id = setInterval(async () => {
+      if (syncLock) return; // Prevent auto-sync during manual sync
       if (!activeProjectId || !activeProject) return;
       if (selectedRowKeys.length === 0) return;
-      const shareId =
+      
+      setSyncLock(true);
+      try {
+        const shareId =
         activeProject.shareId ??
         (typeof crypto !== "undefined" && "randomUUID" in crypto
           ? (crypto as Crypto).randomUUID()
@@ -150,7 +163,8 @@ export default function Home() {
       const dbFiles = await db.files.where("id").anyOf(ids as number[]).toArray();
       const payloadFiles = dbFiles
         .filter((f) => serverContents.get(f.path) !== f.content)
-        .map((f) => ({ path: f.path, content: f.content }));
+        .map((f) => ({ path: f.path, content: sanitizeContent(f.content) }))
+        .filter((f) => f.content.length > 0);
       if (payloadFiles.length) {
         try {
           setSyncing(true);
@@ -174,6 +188,11 @@ export default function Home() {
           setSyncing(false);
         }
       }
+    } catch {
+      // ignore
+    } finally {
+      setSyncLock(false);
+    }
     }, 30000);
     return () => clearInterval(id);
   }, [autoSync, activeProjectId, activeProject, selectedRowKeys, serverContents]);
@@ -236,63 +255,103 @@ export default function Home() {
   };
 
   const onSyncSelected = async () => {
+    if (syncLock) return; // Prevent double-clicks
     if (!activeProjectId || !activeProject) return;
     if (selectedRowKeys.length === 0) return;
-    const ids = (selectedRowKeys as React.Key[]).map((k) => Number(k));
-    const shareId =
-      activeProject.shareId ??
-      (typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? (crypto as Crypto).randomUUID()
-        : `share_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
-    if (!activeProject.shareId) {
-      await db.projects.update(activeProjectId, { shareId });
-    }
-    // Ensure latest server snapshot before diffing
+    
+    setSyncLock(true);
     try {
-      const statusRes = await fetch(`/api/share?shareId=${encodeURIComponent(shareId)}`);
-      if (statusRes.ok) {
-        const data: { files: { path: string; content: string }[] } = await statusRes.json();
-        setServerContents(new Map((data.files || []).map((f) => [f.path, f.content])));
+      const ids = (selectedRowKeys as React.Key[]).map((k) => Number(k));
+      const shareId =
+        activeProject.shareId ??
+        (typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? (crypto as Crypto).randomUUID()
+          : `share_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
+      if (!activeProject.shareId) {
+        await db.projects.update(activeProjectId, { shareId });
       }
-    } catch {
-      // ignore
-    }
-    const dbFiles = await db.files.where("id").anyOf(ids as number[]).toArray();
-    const toUpload = dbFiles.filter((f) => serverContents.get(f.path) !== f.content);
-    const unchanged = dbFiles.filter((f) => serverContents.get(f.path) === f.content);
-    const payloadFiles = toUpload.map((f) => ({ path: f.path, content: f.content }));
-    const link = `${window.location.origin}/share/${shareId}`;
-    const key = "sync";
-    message.loading({ content: "Syncing...", key, duration: 0 });
-    try {
+      // Ensure latest server snapshot before diffing
+      try {
+        const statusRes = await fetch(`/api/share?shareId=${encodeURIComponent(shareId)}`);
+        if (statusRes.ok) {
+          const data: { files: { path: string; content: string }[] } = await statusRes.json();
+          setServerContents(new Map((data.files || []).map((f) => [f.path, f.content])));
+        }
+      } catch {
+        // ignore
+      }
+      const dbFiles = await db.files.where("id").anyOf(ids as number[]).toArray();
+      const toUpload = dbFiles.filter((f) => serverContents.get(f.path) !== f.content);
+      const unchanged = dbFiles.filter((f) => serverContents.get(f.path) === f.content);
+      const payloadFiles = toUpload
+        .map((f) => ({ path: f.path, content: sanitizeContent(f.content) }))
+        .filter((f) => f.content.length > 0);
+      const link = `${window.location.origin}/share/${shareId}`;
+      const key = "sync";
+      message.loading({ content: "Syncing...", key, duration: 0 });
       setSyncing(true);
       const expiresAt =
         expiryChoice === "permanent"
           ? undefined
           : new Date(Date.now() + (expiryChoice === "1h" ? 3600e3 : 86400e3)).toISOString();
       if (payloadFiles.length || privatePassword || expiresAt) {
-        const res = await fetch("/api/sync", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            shareId,
-            projectName: activeProject.name,
-            files: payloadFiles,
-            expiresAt,
-            password: privatePassword || undefined,
-          }),
-        });
-        if (!res.ok) throw new Error("Sync failed");
-      }
+          // Size-based batching to avoid Vercel 4.5MB limit
+          const TARGET_SIZE = 3.5 * 1024 * 1024; // 3.5MB target per batch
+          const batches: typeof payloadFiles[] = [];
+          let currentBatch: typeof payloadFiles = [];
+          let currentSize = 0;
+          
+          for (const file of payloadFiles) {
+            const fileSize = new TextEncoder().encode(JSON.stringify({
+              shareId,
+              projectName: activeProject.name,
+              files: [file],
+              expiresAt,
+              password: privatePassword || undefined,
+            })).length;
+            
+            if (currentSize + fileSize > TARGET_SIZE && currentBatch.length > 0) {
+              batches.push(currentBatch);
+              currentBatch = [file];
+              currentSize = fileSize;
+            } else {
+              currentBatch.push(file);
+              currentSize += fileSize;
+            }
+          }
+          
+          if (currentBatch.length > 0) {
+            batches.push(currentBatch);
+          }
+          
+          for (const batch of batches) {
+            const res = await fetch("/api/sync", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                shareId,
+                projectName: activeProject.name,
+                files: batch,
+                expiresAt,
+                password: privatePassword || undefined,
+              }),
+            });
+            if (!res.ok) throw new Error(`Batch sync failed: ${res.statusText}`);
+            // Small delay between batches to avoid rate limits
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
       const now = new Date().toISOString();
       const unchangedIds = unchanged.map((f) => f.id as number);
       const uploadedIds = toUpload.map((f) => f.id as number);
-      if (unchangedIds.length) {
-        await db.files.where("id").anyOf(unchangedIds).modify({ lastSync: now });
-      }
-      if (uploadedIds.length) {
-        await db.files.where("id").anyOf(uploadedIds).modify({ lastSync: now });
-      }
+      await db.transaction('rw', db.files, async () => {
+        if (unchangedIds.length) {
+          await db.files.where("id").anyOf(unchangedIds).modify({ lastSync: now });
+        }
+        if (uploadedIds.length) {
+          await db.files.where("id").anyOf(uploadedIds).modify({ lastSync: now });
+        }
+      });
       try {
         const statusRes = await fetch(`/api/share?shareId=${encodeURIComponent(shareId)}`);
         if (statusRes.ok) {
@@ -326,9 +385,10 @@ export default function Home() {
         ),
       });
     } catch {
-      message.error({ key, content: "Sync failed" });
+      message.error({ key: "sync", content: "Sync failed" });
     } finally {
       setSyncing(false);
+      setSyncLock(false);
     }
   };
 
@@ -486,7 +546,9 @@ export default function Home() {
                     type="default"
                     icon={<CloudSyncOutlined />}
                     onClick={async () => {
+                      if (syncLock || syncing) return;
                       if (!activeProjectId || !activeProject) return;
+                      setSyncLock(true);
                       const shareId =
                         activeProject.shareId ??
                         (typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -515,7 +577,8 @@ export default function Home() {
                       const allFiles = await db.files.where({ projectId: activeProjectId }).toArray();
                       const payloadFiles = allFiles
                         .filter((f) => serverContents.get(f.path) !== f.content)
-                        .map((f) => ({ path: f.path, content: f.content }));
+                        .map((f) => ({ path: f.path, content: sanitizeContent(f.content) }))
+                        .filter((f) => f.content.length > 0);
                       const keyAll = "sync-all";
                       message.loading({ content: "Syncing all files...", key: keyAll, duration: 0 });
                       try {
@@ -553,6 +616,7 @@ export default function Home() {
                         message.error({ key: keyAll, content: "Sync failed" });
                       } finally {
                         setSyncing(false);
+                        setSyncLock(false);
                       }
                     }}
                   >
@@ -655,6 +719,108 @@ export default function Home() {
                   />
                 </Space>
               </Space>
+              <div style={{ marginBottom: 12 }}>
+                <Button
+                  type="primary"
+                  size="large"
+                  style={{ width: "100%" }}
+                  onClick={async () => {
+                    if (!activeProject) {
+                      message.info("No active project");
+                      return;
+                    }
+                    try {
+                      const projectFiles = await db.files.where({ projectId: activeProject.id as number }).toArray();
+                      const filtered = projectFiles.filter((f) => !/\.(png|svg|ico)$/i.test(f.path));
+                      const sorted = [...filtered].sort((a, b) => a.path.localeCompare(b.path));
+                      type Node = { name: string; children: Map<string, Node>; isFile?: boolean };
+                      const root: Node = { name: "", children: new Map() };
+                      for (const f of sorted) {
+                        const parts = f.path.split("/").filter(Boolean);
+                        let cur = root;
+                        for (let i = 0; i < parts.length; i++) {
+                          const part = parts[i]!;
+                          if (!cur.children.has(part)) cur.children.set(part, { name: part, children: new Map() });
+                          const child = cur.children.get(part)!;
+                          if (i === parts.length - 1) child.isFile = true;
+                          cur = child;
+                        }
+                      }
+                      const lines: string[] = [];
+                      const walk = (node: Node, prefix: string) => {
+                        const entries = Array.from(node.children.values()).sort((a, b) => a.name.localeCompare(b.name));
+                        entries.forEach((child, idx) => {
+                          const isLast = idx === entries.length - 1;
+                          const connector = isLast ? "└── " : "├── ";
+                          lines.push(prefix + connector + child.name + (child.isFile ? "" : "/"));
+                          if (child.children.size > 0) {
+                            const nextPrefix = prefix + (isLast ? "    " : "│   ");
+                            walk(child, nextPrefix);
+                          }
+                        });
+                      };
+                      walk(root, "");
+                      const treeText = lines.join("\n");
+                      const parts: string[] = [];
+                      parts.push(`# Project: ${activeProject.name}`);
+                      parts.push("");
+                      parts.push("## File Structure");
+                      parts.push("");
+                      parts.push(treeText || "(no files)");
+                      parts.push("");
+                      const extToFence = (path: string) => {
+                        const lower = path.toLowerCase();
+                        const map: Record<string, string> = {
+                          ".ts": "typescript",
+                          ".tsx": "tsx",
+                          ".js": "javascript",
+                          ".jsx": "jsx",
+                          ".json": "json",
+                          ".css": "css",
+                          ".scss": "scss",
+                          ".md": "markdown",
+                          ".py": "python",
+                          ".go": "go",
+                          ".rs": "rust",
+                          ".java": "java",
+                          ".kt": "kotlin",
+                          ".swift": "swift",
+                          ".rb": "ruby",
+                          ".php": "php",
+                          ".sh": "bash",
+                          ".yml": "yaml",
+                          ".yaml": "yaml",
+                          ".toml": "toml",
+                          ".xml": "xml",
+                          ".sql": "sql",
+                          ".c": "c",
+                          ".cpp": "cpp",
+                          ".h": "c",
+                          ".hpp": "cpp",
+                        };
+                        const idx = lower.lastIndexOf(".");
+                        return idx >= 0 ? map[lower.slice(idx)] || "" : "";
+                      };
+                      for (const f of sorted) {
+                        parts.push("code");
+                        parts.push("Code");
+                        parts.push(`### File: ${f.path}`);
+                        parts.push("```" + extToFence(f.path));
+                        parts.push(f.content);
+                        parts.push("```");
+                        parts.push("");
+                      }
+                      const text = parts.join("\n");
+                      await navigator.clipboard.writeText(text);
+                      message.success("Context copied to clipboard");
+                    } catch {
+                      message.error("Copy failed");
+                    }
+                  }}
+                >
+                  Copy Context to Clipboard
+                </Button>
+              </div>
               <Table<FileRow>
                 rowKey="id"
                 size="middle"
