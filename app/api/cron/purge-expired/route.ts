@@ -2,7 +2,11 @@ import { NextResponse } from "next/server";
 import { connectMongo } from "@/lib/mongodb";
 import mongoose from "mongoose";
 
-export async function POST() {
+export async function POST(req: Request) {
+  const cronSecret = process.env.CRON_SECRET;
+  const authHeader = req.headers.get('authorization');
+  if (authHeader !== `Bearer ${cronSecret}`) return new Response("Unauthorized", { status: 401 });
+
   try {
     await connectMongo();
     const db = mongoose.connection.db;
